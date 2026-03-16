@@ -92,13 +92,14 @@ def loop_body(
     prompt_embeds,
     txt_ids,
     vec,
-    guidance_vec,
+    guidance_arr,
 ):
   latents, state, c_ts, p_ts = args
   latents_dtype = latents.dtype
   t_curr = c_ts[step]
   t_prev = p_ts[step]
   t_vec = jnp.full((latents.shape[0],), t_curr, dtype=latents.dtype)
+  guidance_vec = guidance_arr[step]
   pred = transformer.apply(
       {"params": state.params},
       hidden_states=latents,
@@ -136,7 +137,7 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
 
 
 def run_inference(
-    states, transformer, vae, config, mesh, latents, latent_image_ids, prompt_embeds, txt_ids, vec, guidance_vec, c_ts, p_ts
+    states, transformer, vae, config, mesh, latents, latent_image_ids, prompt_embeds, txt_ids, vec, guidance_arr, c_ts, p_ts
 ):
   transformer_state = states["transformer"]
   vae_state = states["vae"]
@@ -148,7 +149,7 @@ def run_inference(
       prompt_embeds=prompt_embeds,
       txt_ids=txt_ids,
       vec=vec,
-      guidance_vec=guidance_vec,
+      guidance_arr=guidance_arr,
   )
   vae_decode_p = functools.partial(vae_decode, vae=vae, state=vae_state, config=config)
 
@@ -358,16 +359,25 @@ def run(config):
         max_sequence_length=config.max_sequence_length,
     )
 
-    def validate_inputs(latents, latent_image_ids, prompt_embeds, text_ids, timesteps, guidance, pooled_prompt_embeds):
+    def validate_inputs(latents, latent_image_ids, prompt_embeds, text_ids, timesteps, guidance_arr, pooled_prompt_embeds):
       print("latents.shape: ", latents.shape, latents.dtype)
       print("latent_image_ids.shape: ", latent_image_ids.shape, latent_image_ids.dtype)
       print("text_ids.shape: ", text_ids.shape, text_ids.dtype)
       print("prompt_embeds: ", prompt_embeds.shape, prompt_embeds.dtype)
       print("timesteps.shape: ", timesteps.shape, timesteps.dtype)
-      print("guidance.shape: ", guidance.shape, guidance.dtype)
+      print("guidance_arr.shape: ", guidance_arr.shape, guidance_arr.dtype)
       print("pooled_prompt_embeds.shape: ", pooled_prompt_embeds.shape, pooled_prompt_embeds.dtype)
 
-    guidance = jnp.asarray([config.guidance_scale] * global_batch_size, dtype=jnp.bfloat16)
+    # Build per-step guidance array: (num_inference_steps, batch_size)
+    guidance_scales = list(config.guidance_scale)
+    if len(guidance_scales) == 1:
+      guidance_scales = guidance_scales * config.num_inference_steps
+    assert len(guidance_scales) == config.num_inference_steps, (
+        f"guidance_scale must have 1 or {config.num_inference_steps} values, got {len(guidance_scales)}"
+    )
+    guidance_arr = jnp.array(
+        [[g] * global_batch_size for g in guidance_scales], dtype=jnp.bfloat16
+    )
 
     # move inputs to device and shard
     data_sharding = jax.sharding.NamedSharding(mesh, P(*config.data_sharding))
@@ -375,7 +385,7 @@ def run(config):
     latent_image_ids = jax.device_put(latent_image_ids)
     prompt_embeds = jax.device_put(prompt_embeds, data_sharding)
     text_ids = jax.device_put(text_ids)
-    guidance = jax.device_put(guidance, data_sharding)
+    guidance_arr = jax.device_put(guidance_arr)
     pooled_prompt_embeds = jax.device_put(pooled_prompt_embeds, data_sharding)
 
     if config.offload_encoders:
@@ -435,7 +445,7 @@ def run(config):
     c_ts = timesteps[:-1]
     p_ts = timesteps[1:]
 
-    validate_inputs(latents, latent_image_ids, prompt_embeds, text_ids, timesteps, guidance, pooled_prompt_embeds)
+    validate_inputs(latents, latent_image_ids, prompt_embeds, text_ids, timesteps, guidance_arr, pooled_prompt_embeds)
 
     p_run_inference = jax.jit(
         functools.partial(
@@ -449,7 +459,7 @@ def run(config):
             prompt_embeds=prompt_embeds,
             txt_ids=text_ids,
             vec=pooled_prompt_embeds,
-            guidance_vec=guidance,
+            guidance_arr=guidance_arr,
             c_ts=c_ts,
             p_ts=p_ts,
         ),
